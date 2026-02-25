@@ -1,7 +1,7 @@
 use crate::types::{BookSnapshot, Side, SideState};
 
 /// Get the SideState for a given Side from a BookSnapshot.
-pub fn side_state<'a>(snap: &'a BookSnapshot, side: Side) -> &'a SideState {
+pub fn side_state(snap: &BookSnapshot, side: Side) -> &SideState {
     match side {
         Side::Yes => &snap.yes,
         Side::No => &snap.no,

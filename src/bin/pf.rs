@@ -3,12 +3,14 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
-use phantomfill::data::polymarket::{import_from_capture_db, PolymarketStore};
-use phantomfill::data::{DataStore, SqliteStore};
+use phantomfill::data::polymarket::{import_from_capture_db, ticks_to_snapshots, PolymarketStore};
+use phantomfill::data::{DataStore, MarketFilter, SqliteStore};
 use phantomfill::fill::{DeLiseConfig, DeLiseFillModel};
-use phantomfill::report::Report;
+use phantomfill::report::{MonteCarloSummary, Report};
 use phantomfill::replay::{ReplayConfig, ReplayEngine};
-use phantomfill::strategies::{create_strategy, list_strategies};
+use phantomfill::strategies::fade::{compute_fade_signals, FadeMomentum};
+use phantomfill::strategies::scripted::RhaiStrategy;
+use phantomfill::strategies::{create_strategy, is_known_strategy, list_strategies};
 
 #[derive(Parser)]
 #[command(name = "pf", about = "PhantomFill -- the honest prediction market backtester")]
@@ -24,6 +26,10 @@ enum Commands {
         /// Strategy to simulate
         #[arg(short, long, default_value = "momentum")]
         strategy: String,
+
+        /// Path to a custom .rhai strategy script (overrides --strategy)
+        #[arg(long)]
+        script: Option<PathBuf>,
 
         /// Bid price
         #[arg(long, default_value = "0.49")]
@@ -44,6 +50,26 @@ enum Commands {
         /// Export results to CSV
         #[arg(long)]
         csv: Option<String>,
+
+        /// Random seed for reproducible results
+        #[arg(long)]
+        seed: Option<u64>,
+
+        /// Number of Monte Carlo runs (default: 1 = single run)
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+        runs: u32,
+
+        /// Minimum streak length for fade strategy
+        #[arg(long, default_value = "3")]
+        min_streak: usize,
+
+        /// Maximum streak length for fade strategy
+        #[arg(long, default_value = "6")]
+        max_streak: usize,
+
+        /// Use PhantomFill native SQLite format (requires --db)
+        #[arg(long)]
+        native: bool,
     },
 
     /// List available strategies
@@ -78,12 +104,21 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Run {
             strategy,
+            script,
             bid_price,
             shares,
             min_bps,
+            min_streak,
+            max_streak,
             db,
             csv,
-        } => cmd_run(strategy, bid_price, shares, min_bps, db, csv),
+            seed,
+            runs,
+            native,
+        } => cmd_run(
+            strategy, script, bid_price, shares, min_bps, min_streak, max_streak, db, csv, seed,
+            runs as usize, native,
+        ),
         Commands::Strategies => cmd_strategies(),
         Commands::Import {
             source,
@@ -93,21 +128,49 @@ fn main() -> Result<()> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_run(
     strategy_name: String,
+    script: Option<PathBuf>,
     bid_price: f64,
     shares: f64,
     min_bps: f64,
+    min_streak: usize,
+    max_streak: usize,
     db_path: Option<String>,
     csv_path: Option<String>,
+    seed: Option<u64>,
+    runs: usize,
+    native: bool,
 ) -> Result<()> {
-    // Validate strategy exists before loading data.
-    if create_strategy(&strategy_name, bid_price, shares, min_bps).is_none() {
+    // If a script is provided, validate it can load; otherwise validate built-in strategy.
+    let using_script = script.is_some();
+    if let Some(ref path) = script {
+        // Validate the script loads successfully (compile check).
+        RhaiStrategy::from_file(path, shares, bid_price)
+            .with_context(|| format!("failed to load script {}", path.display()))?;
+    } else if !is_known_strategy(&strategy_name) {
         let names: Vec<&str> = list_strategies().iter().map(|(n, _)| *n).collect();
         bail!(
             "unknown strategy '{}'. available: {}",
             strategy_name,
             names.join(", ")
+        );
+    }
+
+    if native {
+        return cmd_run_native(
+            strategy_name,
+            script,
+            bid_price,
+            shares,
+            min_bps,
+            min_streak,
+            max_streak,
+            db_path,
+            csv_path,
+            seed,
+            runs,
         );
     }
 
@@ -130,47 +193,263 @@ fn cmd_run(
         bail!("no markets found in database");
     }
 
+    let display_name = if let Some(ref path) = script {
+        format!("script:{}", path.display())
+    } else {
+        strategy_name.clone()
+    };
+
     println!(
         "Loaded {} markets. Running strategy '{}' (bid={}, shares={}, min_bps={})...",
         markets.len(),
-        strategy_name,
+        display_name,
         bid_price,
         shares,
         min_bps
     );
 
-    // Create fill model and replay engine.
-    let fill_model = Box::new(DeLiseFillModel::new(DeLiseConfig::default()));
-    let fill_model_name = "delise-3rule".to_string();
+    let fill_model_name = "delise-3rule";
 
-    let engine = ReplayEngine::new(
-        fill_model,
-        ReplayConfig {
-            bid_price,
-            shares,
-        },
+    // Build strategy factory (fade needs pre-computed signals).
+    let fade_signals = if !using_script && strategy_name == "fade" {
+        let signals = std::sync::Arc::new(compute_fade_signals(&markets, min_streak, max_streak));
+        println!(
+            "  Fade signals: {} of {} windows (streak {}..={})",
+            signals.len(),
+            markets.len(),
+            min_streak,
+            max_streak
+        );
+        Some(signals)
+    } else {
+        None
+    };
+
+    let make_strategy = |_sn: &str| -> Box<dyn phantomfill::strategies::Strategy> {
+        if let Some(ref path) = script {
+            Box::new(
+                RhaiStrategy::from_file(path, shares, bid_price)
+                    .expect("script already validated"),
+            )
+        } else if let Some(ref signals) = fade_signals {
+            Box::new(FadeMomentum::new(bid_price, shares, signals.clone()))
+        } else {
+            create_strategy(_sn, bid_price, shares, min_bps).expect("strategy already validated")
+        }
+    };
+
+    if runs <= 1 {
+        let fill_model = Box::new(DeLiseFillModel::new(DeLiseConfig {
+            seed,
+            ..DeLiseConfig::default()
+        }));
+
+        let engine = ReplayEngine::new(
+            fill_model,
+            ReplayConfig {
+                bid_price,
+                shares,
+            },
+        );
+
+        let results = engine.run_all(
+            &markets,
+            &|slug| store.load_snapshots(slug),
+            &|| make_strategy(&strategy_name),
+        );
+
+        let report = Report::from_results(&results, &display_name, fill_model_name);
+        report.print();
+
+        if let Some(ref path) = csv_path {
+            let csv_path_buf = PathBuf::from(path);
+            Report::export_csv(&results, &csv_path_buf)
+                .with_context(|| format!("failed to export CSV to {}", path))?;
+            println!("Results exported to {}", path);
+        }
+    } else {
+        let mut reports = Vec::new();
+        for i in 0..runs {
+            let run_seed = seed.map(|s| s + i as u64).unwrap_or_else(|| {
+                use rand::Rng;
+                rand::thread_rng().gen()
+            });
+            let fill_model = Box::new(DeLiseFillModel::new(DeLiseConfig {
+                seed: Some(run_seed),
+                ..DeLiseConfig::default()
+            }));
+            let engine = ReplayEngine::new(
+                fill_model,
+                ReplayConfig {
+                    bid_price,
+                    shares,
+                },
+            );
+            let results = engine.run_all(
+                &markets,
+                &|slug| store.load_snapshots(slug),
+                &|| make_strategy(&strategy_name),
+            );
+
+            if i == 0 {
+                if let Some(ref path) = csv_path {
+                    let csv_path_buf = PathBuf::from(path);
+                    Report::export_csv(&results, &csv_path_buf)
+                        .with_context(|| format!("failed to export CSV to {}", path))?;
+                    println!("Results exported to {}", path);
+                }
+            }
+
+            let report = Report::from_results(&results, &display_name, fill_model_name);
+            reports.push(report);
+
+            if (i + 1) % 10 == 0 || i + 1 == runs {
+                println!("Monte Carlo run {}/{} complete", i + 1, runs);
+            }
+        }
+        let summary = MonteCarloSummary::from_reports(reports, seed);
+        summary.print();
+    }
+
+    Ok(())
+}
+
+/// Run backtest against PhantomFill native SQLite format (e.g. imported HF data).
+#[allow(clippy::too_many_arguments)]
+fn cmd_run_native(
+    strategy_name: String,
+    script: Option<PathBuf>,
+    bid_price: f64,
+    shares: f64,
+    min_bps: f64,
+    min_streak: usize,
+    max_streak: usize,
+    db_path: Option<String>,
+    csv_path: Option<String>,
+    seed: Option<u64>,
+    runs: usize,
+) -> Result<()> {
+    let db = db_path.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("--native mode requires --db path to a PhantomFill SQLite database")
+    })?;
+
+    let store = SqliteStore::open(&PathBuf::from(db))
+        .with_context(|| format!("failed to open native database at {}", db))?;
+
+    let markets = store
+        .list_markets(&MarketFilter::default())
+        .context("failed to list markets")?;
+
+    if markets.is_empty() {
+        bail!("no markets found in native database");
+    }
+
+    let display_name = if let Some(ref path) = script {
+        format!("script:{}", path.display())
+    } else {
+        strategy_name.clone()
+    };
+
+    println!(
+        "Loaded {} markets (native). Running strategy '{}' (bid={}, shares={}, min_bps={})...",
+        markets.len(),
+        display_name,
+        bid_price,
+        shares,
+        min_bps
     );
 
-    // Run backtest.
-    let results = engine.run_all(
-        &markets,
-        &|slug| store.load_snapshots(slug),
-        &|| {
-            create_strategy(&strategy_name, bid_price, shares, min_bps)
-                .expect("strategy already validated")
-        },
-    );
+    let fill_model_name = "delise-3rule";
 
-    // Build and print report.
-    let report = Report::from_results(&results, &strategy_name, &fill_model_name);
-    report.print();
+    // Closure to load snapshots from the native store.
+    let load_snapshots = |market_id: &str| -> anyhow::Result<Vec<_>> {
+        let ticks = store.load_ticks(market_id)?;
+        Ok(ticks_to_snapshots(market_id, &ticks))
+    };
 
-    // Export CSV if requested.
-    if let Some(ref path) = csv_path {
-        let csv_path = PathBuf::from(path);
-        Report::export_csv(&results, &csv_path)
-            .with_context(|| format!("failed to export CSV to {}", path))?;
-        println!("Results exported to {}", path);
+    // Build strategy factory (fade needs pre-computed signals).
+    let using_script = script.is_some();
+    let fade_signals = if !using_script && strategy_name == "fade" {
+        let signals = std::sync::Arc::new(compute_fade_signals(&markets, min_streak, max_streak));
+        println!(
+            "  Fade signals: {} of {} windows (streak {}..={})",
+            signals.len(),
+            markets.len(),
+            min_streak,
+            max_streak
+        );
+        Some(signals)
+    } else {
+        None
+    };
+
+    let make_strategy = |_sn: &str| -> Box<dyn phantomfill::strategies::Strategy> {
+        if let Some(ref path) = script {
+            Box::new(
+                RhaiStrategy::from_file(path, shares, bid_price)
+                    .expect("script already validated"),
+            )
+        } else if let Some(ref signals) = fade_signals {
+            Box::new(FadeMomentum::new(bid_price, shares, signals.clone()))
+        } else {
+            create_strategy(_sn, bid_price, shares, min_bps).expect("strategy already validated")
+        }
+    };
+
+    if runs <= 1 {
+        let fill_model = Box::new(DeLiseFillModel::new(DeLiseConfig {
+            seed,
+            ..DeLiseConfig::default()
+        }));
+        let engine = ReplayEngine::new(fill_model, ReplayConfig { bid_price, shares });
+
+        let results = engine.run_all(&markets, &load_snapshots, &|| {
+            make_strategy(&strategy_name)
+        });
+
+        let report = Report::from_results(&results, &display_name, fill_model_name);
+        report.print();
+
+        if let Some(ref path) = csv_path {
+            let csv_path_buf = PathBuf::from(path);
+            Report::export_csv(&results, &csv_path_buf)
+                .with_context(|| format!("failed to export CSV to {}", path))?;
+            println!("Results exported to {}", path);
+        }
+    } else {
+        let mut reports = Vec::new();
+        for i in 0..runs {
+            let run_seed = seed.map(|s| s + i as u64).unwrap_or_else(|| {
+                use rand::Rng;
+                rand::thread_rng().gen()
+            });
+            let fill_model = Box::new(DeLiseFillModel::new(DeLiseConfig {
+                seed: Some(run_seed),
+                ..DeLiseConfig::default()
+            }));
+            let engine = ReplayEngine::new(fill_model, ReplayConfig { bid_price, shares });
+            let results = engine.run_all(&markets, &load_snapshots, &|| {
+                make_strategy(&strategy_name)
+            });
+
+            if i == 0 {
+                if let Some(ref path) = csv_path {
+                    let csv_path_buf = PathBuf::from(path);
+                    Report::export_csv(&results, &csv_path_buf)
+                        .with_context(|| format!("failed to export CSV to {}", path))?;
+                    println!("Results exported to {}", path);
+                }
+            }
+
+            let report = Report::from_results(&results, &display_name, fill_model_name);
+            reports.push(report);
+
+            if (i + 1) % 10 == 0 || i + 1 == runs {
+                println!("Monte Carlo run {}/{} complete", i + 1, runs);
+            }
+        }
+        let summary = MonteCarloSummary::from_reports(reports, seed);
+        summary.print();
     }
 
     Ok(())

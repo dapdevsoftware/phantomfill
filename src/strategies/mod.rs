@@ -1,6 +1,10 @@
 pub mod depth;
+pub mod fade;
+pub mod gabagool;
+pub mod last_15s;
 pub mod momentum;
 pub mod post_cancel;
+pub mod scripted;
 pub mod spread_arb;
 
 use crate::types::{Action, BookSnapshot};
@@ -42,6 +46,12 @@ pub fn create_strategy(
         "depth" => Some(Box::new(depth::DepthMomentum::new(
             bid_price, shares, min_bps, 90_000,
         ))),
+        "last_15s" => Some(Box::new(last_15s::Last15Seconds::new(
+            shares, 0.98, 900_000,
+        ))),
+        "gabagool" => Some(Box::new(gabagool::Gabagool::new(
+            shares, 0.99,
+        ))),
         _ => None,
     }
 }
@@ -53,7 +63,15 @@ pub fn list_strategies() -> Vec<(&'static str, &'static str)> {
         ("momentum", "Momentum signal: wait for oracle price movement, bet on predicted winner"),
         ("post_cancel", "Post both + cancel loser: bid both at T+0, cancel predicted loser at signal time"),
         ("depth", "Depth + momentum: like momentum but also requires orderbook depth agreement"),
+        ("fade", "Fade momentum: bet against streaks of consecutive same-direction candles"),
+        ("last_15s", "Last 15 Seconds: buy the side bid at 98c+ in the final 15 seconds"),
+        ("gabagool", "Gabagool combined-price arb: buy YES+NO at different times when combined bid < $1.00"),
     ]
+}
+
+/// Check if a strategy name is valid.
+pub fn is_known_strategy(name: &str) -> bool {
+    list_strategies().iter().any(|(n, _)| *n == name)
 }
 
 #[cfg(test)]

@@ -30,9 +30,23 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Stats
 rand = "0.8"
 
+# Scripting
+rhai = { version = "1", features = ["sync"] }
+
+# HTTP (for Binance kline fetch)
+ureq = { version = "2", features = ["json"] }
+
+# Temp files (for tests)
+[dev-dependencies]
+tempfile = "3"
+
 [[bin]]
 name = "pf"
 path = "src/bin/pf.rs"
+
+[[bin]]
+name = "pf-hf-import"
+path = "src/bin/hf_import.rs"
 
 [lib]
 name = "phantomfill"

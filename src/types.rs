@@ -161,13 +161,24 @@ pub struct SideState {
 }
 
 impl SideState {
-    /// Cumulative bid depth at or above a given price.
+    /// Cumulative bid depth at a given price level.
+    ///
+    /// Finds the exact price level (within epsilon) first. If no exact match,
+    /// falls back to the nearest level at or above the requested price.
     pub fn bid_depth_at(&self, price: f64) -> f64 {
+        const EPSILON: f64 = 1e-9;
+
+        // Exact match first.
+        if let Some(level) = self.depth.iter().find(|l| (l.price - price).abs() < EPSILON) {
+            return level.cumulative_size;
+        }
+
+        // Fallback: nearest level at or above the requested price.
         self.depth
             .iter()
             .filter(|l| l.price >= price)
+            .min_by(|a, b| a.price.partial_cmp(&b.price).unwrap_or(std::cmp::Ordering::Equal))
             .map(|l| l.cumulative_size)
-            .last()
             .unwrap_or(0.0)
     }
 }
@@ -201,6 +212,104 @@ pub struct SimOrder {
     pub filled: bool,
     /// When filled (offset_ms).
     pub filled_at_ms: Option<i64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_side_with_depth(levels: Vec<(f64, f64)>) -> SideState {
+        SideState {
+            best_bid: Some(0.49),
+            best_bid_size: Some(100.0),
+            best_ask: Some(0.51),
+            best_ask_size: Some(100.0),
+            depth: levels
+                .into_iter()
+                .map(|(price, cumulative_size)| PriceLevel {
+                    price,
+                    cumulative_size,
+                })
+                .collect(),
+            total_bid_depth: 0.0,
+            total_ask_depth: 0.0,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression test: Bug 1 — bid_depth_at returns depth at exact price,
+    // not at the last matching level via `.last()`.
+    // Three levels: 0.49→500, 0.50→120, 0.51→50.
+    // Querying 0.49 must return 500.0, not 50.0 (which `.last()` would give
+    // after filtering levels >= 0.49, since 0.49 < 0.50 < 0.51).
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_bid_depth_at_exact_match_first_level() {
+        let side = make_side_with_depth(vec![(0.49, 500.0), (0.50, 120.0), (0.51, 50.0)]);
+
+        // Exact match at 0.49 must return 500.0.
+        assert_eq!(
+            side.bid_depth_at(0.49),
+            500.0,
+            "bid_depth_at(0.49) should return 500.0, not the last filtered value"
+        );
+    }
+
+    #[test]
+    fn test_bid_depth_at_exact_match_middle_level() {
+        let side = make_side_with_depth(vec![(0.49, 500.0), (0.50, 120.0), (0.51, 50.0)]);
+
+        assert_eq!(
+            side.bid_depth_at(0.50),
+            120.0,
+            "bid_depth_at(0.50) should return 120.0"
+        );
+    }
+
+    #[test]
+    fn test_bid_depth_at_exact_match_last_level() {
+        let side = make_side_with_depth(vec![(0.49, 500.0), (0.50, 120.0), (0.51, 50.0)]);
+
+        assert_eq!(
+            side.bid_depth_at(0.51),
+            50.0,
+            "bid_depth_at(0.51) should return 50.0"
+        );
+    }
+
+    #[test]
+    fn test_bid_depth_at_no_exact_match_falls_back_to_nearest_above() {
+        // No level at 0.495 — nearest above is 0.50 with 120.0.
+        let side = make_side_with_depth(vec![(0.49, 500.0), (0.50, 120.0), (0.51, 50.0)]);
+
+        assert_eq!(
+            side.bid_depth_at(0.495),
+            120.0,
+            "bid_depth_at(0.495) should fall back to nearest level above (0.50 → 120.0)"
+        );
+    }
+
+    #[test]
+    fn test_bid_depth_at_above_all_levels_returns_zero() {
+        let side = make_side_with_depth(vec![(0.49, 500.0), (0.50, 120.0)]);
+
+        assert_eq!(
+            side.bid_depth_at(0.55),
+            0.0,
+            "bid_depth_at above all levels should return 0.0"
+        );
+    }
+
+    #[test]
+    fn test_bid_depth_at_empty_depth_returns_zero() {
+        let side = make_side_with_depth(vec![]);
+
+        assert_eq!(
+            side.bid_depth_at(0.49),
+            0.0,
+            "bid_depth_at with no depth levels should return 0.0"
+        );
+    }
 }
 
 /// Complete result for one simulated market window.

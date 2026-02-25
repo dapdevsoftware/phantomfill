@@ -57,6 +57,12 @@ impl ReplayEngine {
         let mut signal_offset_ms: Option<i64> = None;
 
         for snap in snapshots {
+            // Process fill model BEFORE strategy actions so adverse fills
+            // can happen on the same tick as a cancel (prevents cancel/fill race bias).
+            self.fill_model
+                .process_tick(snap, &mut orders, prev_offset_ms);
+            prev_offset_ms = snap.offset_ms;
+
             // Get strategy actions for this tick.
             let actions = strategy.on_tick(snap);
 
@@ -113,11 +119,6 @@ impl ReplayEngine {
                     }
                 }
             }
-
-            // Process fill model for all orders against this tick.
-            self.fill_model
-                .process_tick(snap, &mut orders, prev_offset_ms);
-            prev_offset_ms = snap.offset_ms;
         }
 
         // Compute naive PnL: assumes every non-cancelled PlaceBid fills.
@@ -797,5 +798,284 @@ mod tests {
         // Realistic = 0 since nothing filled.
         assert!((result.realistic_pnl).abs() < 1e-9);
         assert!(!result.filled);
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression test: Bug 2 — orders placed on tick N must NOT be
+    // fill-processed on tick N. They should only be processable starting
+    // from tick N+1.
+    //
+    // The fix moved process_tick to run BEFORE strategy actions in the loop,
+    // so orders are placed after process_tick runs for that tick.
+    // -----------------------------------------------------------------------
+
+    /// A fill model that fills any order immediately (on the very first
+    /// process_tick call after it is pushed to the orders slice), using
+    /// `snap.offset_ms >= order.placed_at_ms` (non-strict comparison).
+    /// If Bug 2 were present (order placed before process_tick on same tick),
+    /// this would fill the order on tick N. With the fix, tick N's process_tick
+    /// runs before the order is placed, so the first chance to fill is tick N+1.
+    struct ImmediateFillModel;
+
+    impl FillModel for ImmediateFillModel {
+        fn name(&self) -> &str {
+            "immediate-fill"
+        }
+
+        fn create_order(
+            &self,
+            side: Side,
+            price: f64,
+            shares: f64,
+            _snap: &BookSnapshot,
+            offset_ms: i64,
+        ) -> SimOrder {
+            SimOrder {
+                side,
+                price,
+                shares,
+                placed_at_ms: offset_ms,
+                queue_ahead: 0.0,
+                queue_consumed: 0.0,
+                filled: false,
+                filled_at_ms: None,
+            }
+        }
+
+        fn process_tick(
+            &self,
+            snap: &BookSnapshot,
+            orders: &mut [SimOrder],
+            _prev_offset_ms: i64,
+        ) -> Vec<usize> {
+            let mut filled = Vec::new();
+            for (i, order) in orders.iter_mut().enumerate() {
+                if order.filled {
+                    continue;
+                }
+                // Non-strict: fills if snap.offset_ms >= placed_at_ms.
+                // With the fix, process_tick runs before PlaceBid on the same tick,
+                // so the order does not exist yet when this runs at tick N.
+                // At tick N+1, snap.offset_ms > placed_at_ms => fills.
+                if snap.offset_ms >= order.placed_at_ms {
+                    order.filled = true;
+                    order.filled_at_ms = Some(snap.offset_ms);
+                    filled.push(i);
+                }
+            }
+            filled
+        }
+
+        fn adverse_selection_filter(&self, _order: &SimOrder, _is_winner: bool) -> bool {
+            true
+        }
+    }
+
+    /// Strategy that places a YES bid on the very first tick (offset=0).
+    struct PlaceOnFirstTick {
+        placed: bool,
+    }
+
+    impl PlaceOnFirstTick {
+        fn new() -> Self {
+            Self { placed: false }
+        }
+    }
+
+    impl crate::strategies::Strategy for PlaceOnFirstTick {
+        fn name(&self) -> &str {
+            "place-on-first-tick"
+        }
+        fn description(&self) -> &str {
+            "places YES bid on first tick"
+        }
+        fn on_tick(&mut self, _snap: &BookSnapshot) -> Vec<crate::types::Action> {
+            if !self.placed {
+                self.placed = true;
+                vec![crate::types::Action::PlaceBid {
+                    side: Side::Yes,
+                    price: 0.49,
+                    shares: 10.0,
+                }]
+            } else {
+                vec![]
+            }
+        }
+        fn reset(&mut self) {
+            self.placed = false;
+        }
+    }
+
+    #[test]
+    fn test_order_placed_on_tick_n_not_filled_on_tick_n() {
+        // Two ticks: offset 0 and offset 1000.
+        // Order is placed at tick 0 (offset=0).
+        // ImmediateFillModel uses >=, so WITHOUT the fix, it would fill at tick 0.
+        // WITH the fix (process_tick runs before PlaceBid), the order does not
+        // exist during tick 0's process_tick call, so it only fills at tick 1.
+        let engine = ReplayEngine::new(Box::new(ImmediateFillModel), ReplayConfig::default());
+        let market = make_market(Some(Outcome::Yes));
+
+        let snaps = vec![
+            make_test_snap(0, Some(50000.0), 500.0, 500.0),
+            make_test_snap(1000, Some(50000.0), 500.0, 500.0),
+        ];
+
+        let mut strategy = PlaceOnFirstTick::new();
+        let result = engine.run_window(&market, &snaps, &mut strategy).unwrap();
+
+        // Order must fill (at tick N+1), not be unfilled.
+        assert!(result.filled, "order should fill at tick N+1");
+
+        // The fill must happen at offset 1000 (tick N+1), NOT at offset 0 (tick N).
+        assert_eq!(
+            result.fill_time_ms,
+            Some(1000),
+            "order placed at tick 0 must fill at tick 1 (offset 1000), not tick 0"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression test: Bug 5 — adverse fill CAN happen on the same tick as
+    // a cancel. Since process_tick now runs BEFORE strategy actions (cancels),
+    // an adverse fill at tick N is applied before the cancel at tick N.
+    // This prevents the cancel/fill race from unfairly blocking real fills.
+    // -----------------------------------------------------------------------
+
+    /// A fill model that fills the first unfilled order it finds on every tick,
+    /// regardless of placed_at_ms. Used to simulate an adverse fill.
+    struct AdverseFillAlwaysModel;
+
+    impl FillModel for AdverseFillAlwaysModel {
+        fn name(&self) -> &str {
+            "adverse-fill-always"
+        }
+
+        fn create_order(
+            &self,
+            side: Side,
+            price: f64,
+            shares: f64,
+            _snap: &BookSnapshot,
+            offset_ms: i64,
+        ) -> SimOrder {
+            SimOrder {
+                side,
+                price,
+                shares,
+                placed_at_ms: offset_ms,
+                queue_ahead: 0.0,
+                queue_consumed: 0.0,
+                filled: false,
+                filled_at_ms: None,
+            }
+        }
+
+        fn process_tick(
+            &self,
+            snap: &BookSnapshot,
+            orders: &mut [SimOrder],
+            _prev_offset_ms: i64,
+        ) -> Vec<usize> {
+            let mut filled = Vec::new();
+            for (i, order) in orders.iter_mut().enumerate() {
+                if !order.filled {
+                    order.filled = true;
+                    order.filled_at_ms = Some(snap.offset_ms);
+                    filled.push(i);
+                }
+            }
+            filled
+        }
+
+        fn adverse_selection_filter(&self, _order: &SimOrder, _is_winner: bool) -> bool {
+            true
+        }
+    }
+
+    /// Strategy that: places YES bid at tick 0, then cancels YES at tick 1.
+    /// If fills run before cancels (the fix), the YES order will be filled
+    /// at tick 1 before the cancel is applied, leaving filled=true with
+    /// a real filled_at_ms.
+    struct PlaceThenCancelStrategy {
+        placed: bool,
+        cancelled: bool,
+    }
+
+    impl PlaceThenCancelStrategy {
+        fn new() -> Self {
+            Self {
+                placed: false,
+                cancelled: false,
+            }
+        }
+    }
+
+    impl crate::strategies::Strategy for PlaceThenCancelStrategy {
+        fn name(&self) -> &str {
+            "place-then-cancel"
+        }
+        fn description(&self) -> &str {
+            "places YES at tick 0, cancels YES at tick 1"
+        }
+        fn on_tick(&mut self, _snap: &BookSnapshot) -> Vec<crate::types::Action> {
+            if !self.placed {
+                self.placed = true;
+                vec![crate::types::Action::PlaceBid {
+                    side: Side::Yes,
+                    price: 0.49,
+                    shares: 10.0,
+                }]
+            } else if !self.cancelled {
+                self.cancelled = true;
+                vec![crate::types::Action::Cancel { side: Side::Yes }]
+            } else {
+                vec![]
+            }
+        }
+        fn reset(&mut self) {
+            self.placed = false;
+            self.cancelled = false;
+        }
+    }
+
+    #[test]
+    fn test_adverse_fill_happens_before_cancel_on_same_tick() {
+        // Scenario:
+        //   Tick 0: Strategy places YES bid. process_tick runs first (no orders yet), then PlaceBid.
+        //   Tick 1: process_tick runs first => fills YES order. Then strategy emits Cancel{YES}.
+        //           The cancel finds the YES order already filled, so it cannot cancel it.
+        //
+        // With the fix, the fill survives: filled=true, filled_at_ms=Some(1000).
+        // Without the fix (cancel before process_tick), the cancel would mark the order
+        // as cancelled before process_tick sees it, resulting in no real fill.
+        let engine = ReplayEngine::new(Box::new(AdverseFillAlwaysModel), ReplayConfig::default());
+        let market = make_market(Some(Outcome::Yes));
+
+        let snaps = vec![
+            make_test_snap(0, Some(50000.0), 500.0, 500.0),
+            make_test_snap(1000, Some(50000.0), 500.0, 500.0),
+        ];
+
+        let mut strategy = PlaceThenCancelStrategy::new();
+        let result = engine.run_window(&market, &snaps, &mut strategy).unwrap();
+
+        // The YES order must be filled (not cancelled), because the fill model
+        // runs BEFORE the cancel in the fixed code.
+        assert!(
+            result.filled,
+            "adverse fill must survive: process_tick runs before cancel on tick 1"
+        );
+        assert_eq!(
+            result.fill_time_ms,
+            Some(1000),
+            "fill should be recorded at tick 1 offset (1000 ms)"
+        );
+        // Since filled=true and filled_at_ms is set, the cancel attempt on the
+        // already-filled order has no effect. The result should show it as filled.
+        assert!(
+            result.realistic_pnl > 0.0,
+            "filled YES order in YES-outcome market should yield positive realistic PnL"
+        );
     }
 }

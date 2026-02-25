@@ -4,3 +4,6 @@ Cargo.lock
 *.sqlite
 *.parquet
 .env
+/data/
+/site/
+/scripts/

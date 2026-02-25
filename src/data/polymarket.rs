@@ -265,7 +265,7 @@ fn tick_to_side_state(tick: &BookTick) -> SideState {
 /// At each offset, UP (Yes) and/or DOWN (No) ticks are combined into one
 /// snapshot. If a side is missing at a given offset, the previous snapshot's
 /// state for that side is carried forward.
-fn ticks_to_snapshots(market_id: &str, ticks: &[BookTick]) -> Vec<BookSnapshot> {
+pub fn ticks_to_snapshots(market_id: &str, ticks: &[BookTick]) -> Vec<BookSnapshot> {
     if ticks.is_empty() {
         return Vec::new();
     }

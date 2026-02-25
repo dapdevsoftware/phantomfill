@@ -1,4 +1,4 @@
-/// DDL for PhantomFill's own SQLite tables.
+//! DDL for PhantomFill's own SQLite tables.
 
 pub const CREATE_MARKETS: &str = "
 CREATE TABLE IF NOT EXISTS pf_markets (

@@ -14,6 +14,10 @@ use crate::fill::model::FillModel;
 use crate::fill::queue;
 use crate::types::{BookSnapshot, Side, SimOrder};
 
+use rand::rngs::StdRng;
+use rand::SeedableRng;
+use std::cell::RefCell;
+
 /// Configuration for the DeLise fill model.
 #[derive(Debug, Clone)]
 pub struct DeLiseConfig {
@@ -27,6 +31,8 @@ pub struct DeLiseConfig {
     pub signal_offset_ms: i64,
     /// Taker rate multiplier after signal becomes public (default 1.8).
     pub post_signal_taker_mult: f64,
+    /// Optional seed for reproducible RNG. None uses entropy.
+    pub seed: Option<u64>,
 }
 
 impl Default for DeLiseConfig {
@@ -37,6 +43,7 @@ impl Default for DeLiseConfig {
             winner_queue_threshold: 50.0,
             signal_offset_ms: 90_000,
             post_signal_taker_mult: 1.8,
+            seed: None,
         }
     }
 }
@@ -44,6 +51,7 @@ impl Default for DeLiseConfig {
 /// DeLise 3-rule fill model for prediction markets.
 pub struct DeLiseFillModel {
     config: DeLiseConfig,
+    rng: RefCell<StdRng>,
     /// Deterministic mode for testing — when Some, this value is used
     /// instead of random sampling for the Rf check.
     deterministic_rand: Option<f64>,
@@ -51,18 +59,24 @@ pub struct DeLiseFillModel {
 
 impl DeLiseFillModel {
     pub fn new(config: DeLiseConfig) -> Self {
+        let rng = match config.seed {
+            Some(seed) => StdRng::seed_from_u64(seed),
+            None => StdRng::from_entropy(),
+        };
         Self {
             config,
+            rng: RefCell::new(rng),
             deterministic_rand: None,
         }
     }
 
     /// Create with deterministic random value for testing.
-    /// The value is used in place of rand::random::<f64>() for Rf checks.
+    /// The value is used in place of the RNG for Rf checks.
     #[cfg(test)]
     pub fn new_deterministic(config: DeLiseConfig, rand_val: f64) -> Self {
         Self {
             config,
+            rng: RefCell::new(StdRng::seed_from_u64(0)),
             deterministic_rand: Some(rand_val),
         }
     }
@@ -71,7 +85,10 @@ impl DeLiseFillModel {
     fn sample_uniform(&self) -> f64 {
         match self.deterministic_rand {
             Some(v) => v,
-            None => rand::random::<f64>(),
+            None => {
+                use rand::Rng;
+                self.rng.borrow_mut().gen::<f64>()
+            }
         }
     }
 
@@ -134,6 +151,11 @@ impl FillModel for DeLiseFillModel {
                 continue;
             }
 
+            // Orders cannot be filled on the same tick they were placed.
+            if order.placed_at_ms == snap.offset_ms {
+                continue;
+            }
+
             let is_post_signal = snap.offset_ms >= self.config.signal_offset_ms;
 
             // Rule 1: Adverse tick — best_ask <= our bid price
@@ -146,12 +168,12 @@ impl FillModel for DeLiseFillModel {
                 order.queue_consumed += sweep_volume;
 
                 // If sweep clears through our position, fill with adverse_fill_prob
-                if order.queue_consumed >= order.queue_ahead {
-                    if self.sample_uniform() < self.config.adverse_fill_prob {
-                        order.filled = true;
-                        order.filled_at_ms = Some(snap.offset_ms);
-                        filled_indices.push(i);
-                    }
+                if order.queue_consumed >= order.queue_ahead
+                    && self.sample_uniform() < self.config.adverse_fill_prob
+                {
+                    order.filled = true;
+                    order.filled_at_ms = Some(snap.offset_ms);
+                    filled_indices.push(i);
                 }
                 continue;
             }
