@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "The honest prediction market backtester. See what would ACTUALLY happen — with realistic fill simulation, queue position modeling, and adverse selection."
 license = "MIT"
-repository = "https://github.com/deividfortuna/phantomfill"
+repository = "https://github.com/dapdevsoftware/phantomfill"
 keywords = ["polymarket", "prediction-market", "backtesting", "simulation", "trading"]
 categories = ["simulation", "finance"]
 
