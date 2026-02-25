@@ -71,7 +71,7 @@ cargo build --release
 
 ### Get Data
 
-PhantomFill works with Polymarket Up/Down market orderbook data. You can:
+PhantomFill works with Polymarket Up/Down market orderbook data. Our infrastructure captures every tick from every BTC/ETH/SOL/XRP Up/Down market, 24/7 — the dataset grows daily. You can:
 
 **Option A** — Import from a [HuggingFace dataset](https://huggingface.co/datasets/trentmkelly/polymarket_orderbook):
 ```bash
