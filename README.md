@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://phantomfill.com/favicon.svg" width="80" alt="PhantomFill">
+  <img src="https://phantomfill.pages.dev/favicon.svg" width="80" alt="PhantomFill">
 </p>
 
 <h1 align="center">PhantomFill</h1>
@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="https://phantomfill.com">Website</a> &middot;
+  <a href="https://phantomfill.pages.dev">Website</a> &middot;
   <a href="#quick-start">Quick Start</a> &middot;
   <a href="#custom-strategies">Custom Strategies</a> &middot;
   <a href="#the-phantom-fill-problem">Why This Exists</a>
